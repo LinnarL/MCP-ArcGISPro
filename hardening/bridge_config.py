@@ -40,6 +40,12 @@ class BridgeConfig:
         "management.DeleteField", "management.DeleteIdentical", "management.TruncateTable",
     ])
 
+    # --- filesystem allowlist (local fork) ---
+    # Every path the bridge reads/writes/lists must be inside one of these roots.
+    # An empty list denies all paths (fail closed).
+    enforce_paths: bool = True
+    allowed_paths: List[str] = field(default_factory=lambda: ["C:/Lokal GIS"])
+
     ipc_dir: str = DEFAULT_IPC
 
     @classmethod

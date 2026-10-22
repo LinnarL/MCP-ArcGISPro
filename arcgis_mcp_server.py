@@ -65,6 +65,12 @@ mcp = FastMCP(
 You are connected to a live ArcGIS Pro session via the MCP bridge.
 The user is assumed to have ArcGIS Pro open with a Map, Scene, or Globe already loaded.
 
+## Filesystem allowlist
+The bridge only accepts paths inside the folders in ping()'s allowedPaths. Anything else
+returns a 'Policy:' error - do not retry it or look for a workaround; tell the user.
+Use absolute local paths. Set the workspace (set_workspace) inside an allowed folder before
+geoprocessing that writes bare output names.
+
 ## Always start with ping()
 Call ping() first on every session to confirm the connection and read project status.
 

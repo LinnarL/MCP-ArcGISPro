@@ -24,6 +24,7 @@ To stop:  _bridge_active = False
 """
 
 import os
+import re
 import json
 import time
 import threading
@@ -62,6 +63,7 @@ arcpy.env.overwriteOutput = True
 ADDIN_STATUS_URL = "http://localhost:5057/status"
 _SYNC_INTERVAL = 2.0  # seconds between checks -- cheap when skipped, rare enough not to spam a closed port
 _last_sync_check = 0.0
+_denied_addin_paths = set()
 
 def _maybe_sync_project_from_addin():
     global _proj, _last_sync_check
@@ -78,6 +80,13 @@ def _maybe_sync_project_from_addin():
 
     new_path = info.get("projectPath")
     if not new_path:
+        return
+    try:
+        PATHS.require(new_path, "add-in project path")
+    except SafetyError as e:
+        if new_path not in _denied_addin_paths:
+            _denied_addin_paths.add(new_path)
+            print("[MCP Bridge] Ignoring add-in project switch: %s" % e)
         return
     current_path = _proj.filePath or ""
     if os.path.normcase(os.path.normpath(new_path)) == os.path.normcase(os.path.normpath(current_path)):
@@ -116,40 +125,21 @@ try:
     from hardening.bridge_safety import check_gp_tool, check_execute_python, SafetyError
     from hardening.bridge_helpers import resolve_param
     from hardening.bridge_logging import get_logger, audit
+    from hardening.bridge_paths import PathPolicy
     CFG = BridgeConfig.load()
     LOG = get_logger(IPC_DIR, CFG.log_level)
+    PATHS = PathPolicy(CFG.allowed_paths, CFG.enforce_paths)
     _HARDENING = True
-    print("[MCP Bridge] Hardening loaded (safe_mode=%s, timeout=%ss)." % (CFG.safe_mode, CFG.timeout_seconds))
-except Exception as _e:  # noqa: BLE001 - graceful fallback by design
-    print("[MCP Bridge] Hardening not loaded (%r); using built-in defaults." % _e)
-
-    LOG = None  # audit() below is a no-op, but LOG must exist (was a silent NameError per command)
-
-    class _CFG:
-        protocol_version = 1
-        # Fallback (no hardening) preserves the ORIGINAL base-bridge behavior of
-        # auto-creating a map. The safer auto_create_map=False default only applies
-        # when the hardening config is actually in effect.
-        auto_create_map = True
-    CFG = _CFG()
-
-    class SafetyError(Exception):
-        pass
-
-    def check_gp_tool(tool, cfg):
-        return None
-
-    def check_execute_python(cfg):
-        return None
-
-    def resolve_param(_arcpy, _m, p):
-        return p
-
-    def get_logger(*a, **k):
-        return None
-
-    def audit(*a, **k):
-        return None
+    print("[MCP Bridge] Hardening loaded (safe_mode=%s, timeout=%ss, paths=%s%s)."
+          % (CFG.safe_mode, CFG.timeout_seconds, PATHS.roots_display,
+             "" if PATHS.enforce else " NOT ENFORCED"))
+    if getattr(CFG, "allow_execute_python", False):
+        print("[MCP Bridge] WARNING: execute_python is enabled; the path allowlist cannot constrain it.")
+except Exception as _e:  # noqa: BLE001
+    # Local fork: FAIL CLOSED. The upstream bridge silently fell back to a fully open
+    # mode here, which would also drop the path allowlist.
+    raise RuntimeError("MCP Bridge refused to start: hardening layer failed to load (%r). "
+                       "Start it from MCP_Bridge.pyt, or pass __file__ when exec'ing." % (_e,))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -174,6 +164,30 @@ def _get_map():
     m = _proj.createMap("Map")
     print("[MCP Bridge] No map found — created 'Map' automatically (auto_create_map=true).")
     return m
+
+
+# ── Path allowlist helpers (local fork) ───────────────────────────────────────
+
+def _check_layer(lyr):
+    """Reject layers whose backing data lives outside the allowed folders."""
+    try:
+        src = lyr.dataSource
+    except Exception:
+        src = None  # group layers, basemaps, etc. have no file source
+    PATHS.check_source(src, "layer '%s' data source" % getattr(lyr, "name", "?"))
+
+
+def _layer_source(name):
+    try:
+        m = _get_map()
+        layers = m.listLayers(name) if m is not None else []
+        return layers[0].dataSource if layers else None
+    except Exception:
+        return None
+
+
+def _effective_workspace():
+    return arcpy.env.workspace or _proj.defaultGeodatabase
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
@@ -211,6 +225,7 @@ def handle_ping(_args):
         # Additive diagnostics: lets the client explain 'Policy:' rejections
         # (execute_python disabled / GP tool blocked) instead of blind retries.
         "hardening":    _HARDENING,
+        "allowedPaths": PATHS.roots_display if PATHS.enforce else None,
         "safeMode":     getattr(CFG, "safe_mode", None),
         "executePythonEnabled": (not getattr(CFG, "safe_mode", False))
                                 or bool(getattr(CFG, "allow_execute_python", False)),
@@ -256,6 +271,7 @@ def handle_add_vector_layer(args):
     path = args.get("path")
     if not path:
         raise ValueError("'path' is required")
+    PATHS.require(path, "path")
     m = _get_map()
     lyr = m.addDataFromPath(path)
     return _ok({"added": lyr.name, "map": m.name})
@@ -265,6 +281,7 @@ def handle_add_raster_layer(args):
     path = args.get("path")
     if not path:
         raise ValueError("'path' is required")
+    PATHS.require(path, "path")
     m = _get_map()
     lyr = m.addDataFromPath(path)
     return _ok({"added": lyr.name, "map": m.name})
@@ -290,6 +307,7 @@ def handle_zoom_to_layer(args):
     layers = m.listLayers(name)
     if not layers:
         raise RuntimeError(f"Layer '{name}' not found.")
+    _check_layer(layers[0])
     view = _proj.activeView
     if view is None:
         return _ok({
@@ -319,6 +337,7 @@ def handle_count_features(args):
     layers = m.listLayers(layer)
     if not layers:
         raise RuntimeError(f"Layer '{layer}' not found.")
+    _check_layer(layers[0])
     count = int(arcpy.management.GetCount(layers[0]).getOutput(0))
     return _ok({"layer": layer, "count": count})
 
@@ -333,6 +352,7 @@ def handle_select_by_attribute(args):
     layers = m.listLayers(layer)
     if not layers:
         raise RuntimeError(f"Layer '{layer}' not found.")
+    _check_layer(layers[0])
     # Count on layers[0] directly, not the SelectLayerByAttribute Result object —
     # the Result token doesn't resolve from this background thread (ERROR 000732),
     # even though the selection itself applies fine to the real Layer object.
@@ -356,6 +376,7 @@ def handle_update_features(args):
     if not layers:
         raise RuntimeError(f"Layer '{layer}' not found.")
 
+    _check_layer(layers[0])
     fields = list(updates.keys())
     values = list(updates.values())
     updated = 0
@@ -367,6 +388,8 @@ def handle_update_features(args):
 
 
 def handle_save_project(_args):
+    if _proj.filePath:
+        PATHS.require(_proj.filePath, "project file")
     _proj.save()
     return _ok({"saved": _proj.filePath})
 
@@ -390,6 +413,9 @@ def handle_run_geoprocessing(args):
         except Exception:
             _gp_map = None
         params = [resolve_param(arcpy, _gp_map, params[0])] + list(params[1:])
+    # Path allowlist: every path / layer data source in the parameters, plus the
+    # workspace that bare output names are written to, must be inside an allowed folder.
+    PATHS.check_gp_params(params, layer_source=_layer_source, workspace=_effective_workspace())
     parts = tool_path.split(".")
     try:
         if len(parts) == 2:
@@ -420,6 +446,7 @@ def handle_get_layer_features(args):
     if not layers:
         raise RuntimeError(f"Layer '{layer}' not found.")
     lyr = layers[0]
+    _check_layer(lyr)
     if not fields:
         fields = [f.name for f in arcpy.ListFields(lyr) if f.type not in ("Geometry", "Blob")]
     rows = []
@@ -441,7 +468,11 @@ def handle_list_fields(args):
     resolved = dataset
     layers = _get_map().listLayers(dataset)
     if layers:
+        _check_layer(layers[0])
         resolved = arcpy.Describe(layers[0]).catalogPath
+        PATHS.check_source(resolved, "dataset")
+    else:
+        PATHS.require(resolved, "dataset")
 
     if not arcpy.Exists(resolved):
         raise RuntimeError(f"Dataset not found: {dataset}")
@@ -470,6 +501,7 @@ def handle_list_feature_classes(args):
     workspace = args.get("workspace")
     pattern   = args.get("pattern", "*")
     feat_type = args.get("feature_type", "")  # Point, Line, Polygon, etc.
+    PATHS.require(workspace or _effective_workspace(), "workspace")
     _prev = arcpy.env.workspace
     try:
         if workspace:
@@ -486,6 +518,7 @@ def handle_list_rasters(args):
     workspace = args.get("workspace")
     pattern   = args.get("pattern", "*")
     raster_type = args.get("raster_type", "")
+    PATHS.require(workspace or _effective_workspace(), "workspace")
     _prev = arcpy.env.workspace
     try:
         if workspace:
@@ -501,12 +534,13 @@ def handle_list_rasters(args):
 def handle_list_tables(args):
     workspace = args.get("workspace")
     pattern   = args.get("pattern", "*")
+    PATHS.require(workspace or _effective_workspace(), "workspace")
     _prev = arcpy.env.workspace
     try:
         if workspace:
             arcpy.env.workspace = workspace
         listed_ws = arcpy.env.workspace
-        tables = arcpy.ListTables(pattern) or []
+        tables =arcpy.ListTables(pattern) or []
     finally:
         if workspace:
             arcpy.env.workspace = _prev
@@ -517,6 +551,7 @@ def handle_set_workspace(args):
     workspace = args.get("workspace")
     if not workspace:
         raise ValueError("'workspace' is required")
+    PATHS.require(workspace, "workspace", allow_memory=False)
     if not arcpy.Exists(workspace):
         raise RuntimeError(f"Workspace not found: {workspace}")
     arcpy.env.workspace = workspace
@@ -550,6 +585,7 @@ def handle_get_unique_values(args):
     layers = m.listLayers(layer)
     if not layers:
         raise RuntimeError(f"Layer '{layer}' not found.")
+    _check_layer(layers[0])
     values = set()
     with arcpy.da.SearchCursor(layers[0], [field]) as cur:
         for row in cur:
@@ -586,6 +622,7 @@ def handle_describe_data(args):
     path = args.get("path")
     if not path:
         raise ValueError("'path' is required")
+    PATHS.require(path, "path")
     if not arcpy.Exists(path):
         raise RuntimeError(f"Path does not exist: {path}")
     desc = arcpy.Describe(path)
@@ -633,6 +670,9 @@ def handle_list_directory(args):
     pattern = args.get("pattern", "*")
     if not path:
         raise ValueError("'path' is required")
+    PATHS.require(path, "path", allow_memory=False)
+    if re.search(r"[\\/]", pattern):
+        raise SafetyError("pattern must not contain path separators; use 'path' to choose the folder.")
     if not os.path.isdir(path):
         raise RuntimeError(f"Directory not found: {path}")
     matches = glob.glob(os.path.join(path, pattern))
@@ -737,6 +777,7 @@ def handle_export_layout(args):
         raise ValueError("'name' is required")
     if not output:
         raise ValueError("'output' is required (full file path)")
+    PATHS.require(output, "output", allow_memory=False)
 
     layouts = _proj.listLayouts(name)
     if not layouts:
@@ -796,7 +837,9 @@ def handle_publish_web_layer(args):
     layers = m.listLayers(layer)
     if not layers:
         raise RuntimeError(f"Layer '{layer}' not found.")
+    _check_layer(layers[0])
     catalog_path = arcpy.Describe(layers[0]).catalogPath
+    PATHS.check_source(catalog_path, "layer catalog path")
 
     # Uses the ArcGIS API for Python (arcgis package) over plain REST, reusing the
     # existing Pro sign-in token via arcpy.GetSigninToken() -- deliberately NOT
@@ -872,10 +915,15 @@ def handle_recipe(args):
     import importlib
     from hardening import recipes as _recipes_mod
     importlib.reload(_recipes_mod)  # hot-reload so new/edited recipes need no bridge restart
+    _recipes_mod.LAYER_CHECK = _check_layer   # reload resets module globals
     RECIPES = _recipes_mod.RECIPES
     fn = RECIPES.get(name)
     if not fn:
         raise ValueError("Unknown recipe '%s'. Available: %s" % (name, sorted(RECIPES)))
+    # Path allowlist for the recipe parameters that name a file or folder.
+    for _k in ("out_path", "out_dir"):
+        if _k in params:
+            PATHS.require(params[_k], "recipe parameter '%s'" % _k, allow_memory=False)
     # Gate recipes through the SAME safe_mode policy as run_geoprocessing/execute_python
     # so they aren't an unrestricted side door: every GP tool a recipe declares must
     # pass check_gp_tool (allowlist + blocklist), and any recipe that runs arbitrary

@@ -194,6 +194,19 @@ To change any of this, copy `hardening/config.example.json` to `~/.arcgis_mcp/co
 
 ---
 
+### Path allowlist (local fork)
+
+This fork confines the bridge to the folders listed in `allowed_paths` (default `["C:/Lokal GIS"]`) in `~/.arcgis_mcp/config.json`; set `enforce_paths` to `false` to turn it off. Paths are normalized, case-folded and resolved through symlinks/junctions, so `..` traversal and sibling folders such as `C:/Lokal GIS-old` do not match. Enforced on:
+
+- `add_vector_layer`, `add_raster_layer`, `describe_data`, `list_directory`, `set_workspace`, `list_feature_classes` / `list_rasters` / `list_tables`, `export_layout`, `save_project`, and the `out_path` / `out_dir` recipe parameters. URLs are rejected.
+- The data source of any layer a tool reads, edits, publishes or reports on (`count_features`, `select_by_attribute`, `update_features`, `get_layer_features`, `get_unique_values`, `list_fields`, `zoom_to_layer`, `publish_web_layer`, recipes), so layers already in the map that point outside the allowlist are unusable.
+- Every string in `run_geoprocessing` parameters (paths, `;`-lists, value tables, layer names) plus the current workspace, since bare output names are written there. If the project's default geodatabase is outside the allowlist, call `set_workspace` first.
+- The optional C# add-in can no longer switch the bridge to a project outside the allowlist.
+
+The bridge now **fails closed**: if the hardening layer cannot load, it refuses to start instead of falling back to the open mode.
+
+Limits: the allowlist cannot constrain `execute_python` (arbitrary code) or tools that evaluate Python code blocks, such as `management.CalculateField`; arcpy `%scratchGDB%`-style tokens and tool-internal temp files are not checked; rendering a map with out-of-bounds layers is not checked. Unit tests: `python hardening/test_paths.py`.
+
 ## Known Limitations
 
 - **Opening a map view automatically** is not possible via Python/ArcPy alone — it's an application-shell action that lives in the compiled ArcGIS Pro SDK, not the arcpy document API. The user must open the map view manually once per session by double-clicking it in the Catalog pane. All other operations work without an open view — for zooming/visualizing a layer specifically, `create_layout()` + `export_layout()` render headlessly and don't need an open view at all.

@@ -17,12 +17,18 @@ import os
 import re
 
 
+# Set by pro_bridge (path allowlist): called with each layer a recipe is about to read.
+LAYER_CHECK = None
+
+
 def _find_layer(m, layer_name):
     if m is None:
         raise RuntimeError("No active map.")
     layers = m.listLayers(layer_name)
     if not layers:
         raise ValueError("Layer '%s' not found in the active map." % layer_name)
+    if LAYER_CHECK is not None:
+        LAYER_CHECK(layers[0])
     return layers[0]
 
 
